@@ -22,27 +22,22 @@ permissions:
 
 jobs:
   test:
+    runs-on: ${{ matrix.os }}
     env:
-      # Setting GOTOOLCHAIN to local tells go
-      # to to use the bundled Go version rather
-      # than fetching the toolchain according to
-      # toolchain directive found in go.mod.
       GOTOOLCHAIN: local
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
         go:
           - 1.26.x
-          - 1.27.1
-        target:
-          - test-coverage
-          - test-s3-storage
-          - test-azure-storage
+          - 1.27.x
     steps:
       -
         name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       -
@@ -51,13 +46,50 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
           cache: false
+          check-latest: true
+      -
+        name: Install Make
+        if: runner.os == 'Windows'
+        run: choco install make --no-progress -y
+      -
+        name: Test
+        shell: bash
+        run: make SHELL=bash test
+
+  test-linux:
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    strategy:
+      fail-fast: false
+      matrix:
+        go:
+          - 1.26.x
+          - 1.27.x
+        target:
+          - test-coverage
+          - test-s3-storage
+          - test-azure-storage
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      -
+        name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+          check-latest: true
       -
         name: Test
         run: |
           make ${{ matrix.target }}
       -
         name: Codecov
-        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           directory: ./
 
@@ -69,10 +101,11 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - test
+      - test-linux
     steps:
       -
         name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -109,21 +142,21 @@ jobs:
       -
         name: Login to DockerHub
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       -
         name: Log in to GitHub Container registry
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
       -
         name: Build artifacts
-        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
         with:
           source: .
           targets: artifact-all
@@ -145,14 +178,14 @@ jobs:
           tree -nh ./bin
       -
         name: Upload artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: registry
           path: ./bin/*
           if-no-files-found: error
       -
         name: Build image
-        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
         with:
           source: .
           files: |

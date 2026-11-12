@@ -2,7 +2,7 @@
 
 # GO_VERSION sets the version of the golang base image to use.
 # It must be a supported tag in the docker.io/library/golang image repository.
-ARG GO_VERSION=1.26.8
+ARG GO_VERSION=1.26.10
 
 # ALPINE_VERSION sets the version of the alpine base image to use, including for the golang image.
 # It must be a supported tag in the docker.io/library/alpine image repository
@@ -31,7 +31,7 @@ RUN --mount=target=. \
 FROM base AS build
 ARG TARGETPLATFORM
 ARG LDFLAGS="-s -w"
-ARG BUILDTAGS=""
+ARG BUILDTAGS="grpcnotrace"
 RUN --mount=type=bind,target=/src \
     --mount=type=cache,target=/root/.cache/go-build \
     --mount=target=/go/pkg/mod,type=cache \
