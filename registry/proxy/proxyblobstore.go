@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -19,10 +20,11 @@ import (
 
 type proxyBlobStore struct {
 	localStore        distribution.BlobStore
-	remoteStore       distribution.BlobService
+	remoteStore       distribution.BlobStore
 	scheduler         *scheduler.TTLExpirationScheduler
 	ttl               *time.Duration
 	cacheWriteTimeout time.Duration
+	rangePassthrough  bool
 	repositoryName    reference.Named
 	authChallenger    authChallenger
 }
@@ -39,7 +41,7 @@ func setResponseHeaders(h http.Header, length int64, mediaType string, digest di
 	h.Set("Content-Length", strconv.FormatInt(length, 10))
 	h.Set("Content-Type", mediaType)
 	h.Set("Docker-Content-Digest", digest.String())
-	h.Set("Etag", digest.String())
+	h.Set("Etag", fmt.Sprintf(`"%s"`, digest))
 }
 
 func (pbs *proxyBlobStore) copyContent(ctx context.Context, dgst digest.Digest, writer io.Writer, h http.Header) (v1.Descriptor, error) {
@@ -80,6 +82,24 @@ func (pbs *proxyBlobStore) serveLocal(ctx context.Context, w http.ResponseWriter
 	return true, pbs.localStore.ServeBlob(ctx, w, r, dgst)
 }
 
+func (pbs *proxyBlobStore) serveBlobRange(ctx context.Context, w http.ResponseWriter, r *http.Request, dgst digest.Digest) (bool, error) {
+	if !pbs.rangePassthrough || r.Method != http.MethodGet || r.Header.Get("Range") == "" {
+		return false, nil
+	}
+
+	// Range responses, including a full 200 fallback, never enter the cache
+	// writer or the digest-wide inflight path.
+	ctx, w = dcontext.WithResponseWriter(ctx, w)
+	err := pbs.remoteStore.ServeBlob(ctx, w, r, dgst)
+	status := ctx.Value("http.response.status")
+	if err == nil && (status == http.StatusOK || status == http.StatusPartialContent) {
+		written := ctx.Value("http.response.written").(int64)
+		proxyMetrics.BlobPull(uint64(written))
+		proxyMetrics.BlobPush(uint64(written), false)
+	}
+	return true, err
+}
+
 func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter, r *http.Request, dgst digest.Digest) error {
 	served, err := pbs.serveLocal(ctx, w, r, dgst)
 	if err != nil {
@@ -92,6 +112,10 @@ func (pbs *proxyBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter,
 	}
 
 	if err := pbs.authChallenger.tryEstablishChallenges(ctx); err != nil {
+		return err
+	}
+
+	if served, err := pbs.serveBlobRange(ctx, w, r, dgst); served || err != nil {
 		return err
 	}
 

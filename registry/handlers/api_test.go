@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"slices"
@@ -28,6 +29,7 @@ import (
 	v2 "github.com/distribution/distribution/v3/registry/api/v2"
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/factory"
+	_ "github.com/distribution/distribution/v3/registry/storage/driver/filesystem"
 	_ "github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
 	"github.com/distribution/distribution/v3/testutil"
 	"github.com/distribution/reference"
@@ -758,6 +760,58 @@ func makeBlobArgs(t *testing.T) blobArgs {
 	return args
 }
 
+type closeErrorBlobWriter struct {
+	distribution.BlobWriter
+	err error
+}
+
+func (w closeErrorBlobWriter) Close() error {
+	_ = w.BlobWriter.Close()
+	return w.err
+}
+
+func TestBlobUploadResponseCloseError(t *testing.T) {
+	env := newTestEnv(t, false)
+	defer env.Shutdown()
+	name, err := reference.WithName("foo/bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := env.app.registry.Repository(env.ctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upload, err := repository.Blobs(env.ctx).Create(env.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upload.Cancel(env.ctx)
+	if _, err := upload.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	closeErr := errors.New("upload close failed")
+	buh := &blobUploadHandler{
+		Context: &Context{
+			App:        env.app,
+			Context:    env.ctx,
+			Repository: repository,
+			urlBuilder: env.builder,
+		},
+		Upload: closeErrorBlobWriter{BlobWriter: upload, err: closeErr},
+		UUID:   upload.ID(),
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPatch, "/", nil)
+	if err := buh.blobUploadResponse(w, r); !errors.Is(err, closeErr) {
+		t.Fatalf("blobUploadResponse error = %v, want %v", err, closeErr)
+	}
+	for _, header := range []string{"Location", "Range", "Docker-Upload-UUID", "Content-Length"} {
+		if value := w.Header().Get(header); value != "" {
+			t.Errorf("failed upload advertised %s: %q", header, value)
+		}
+	}
+}
+
 // TestBlobAPI conducts a full test of the of the blob api.
 func TestBlobAPI(t *testing.T) {
 	deleteEnabled := false
@@ -771,6 +825,55 @@ func TestBlobAPI(t *testing.T) {
 	defer env2.Shutdown()
 	args = makeBlobArgs(t)
 	testBlobAPI(t, env2, args)
+}
+
+func TestBlobAPIFilesystem(t *testing.T) {
+	config := configuration.Configuration{
+		Storage: configuration.Storage{
+			"filesystem": configuration.Parameters{"rootdirectory": t.TempDir()},
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
+				"enabled": false,
+			}},
+		},
+	}
+	config.HTTP.Headers = headerConfig
+	env := newTestEnvWithConfig(t, &config)
+	defer env.Shutdown()
+	testBlobAPI(t, env, makeBlobArgs(t))
+}
+
+// The registry answers a GET with BLOB_UNKNOWN when the blob file is missing
+// on disk and the blob descriptor cache still has its descriptor.
+func TestBlobAPIFilesystemMissingFile(t *testing.T) {
+	root := t.TempDir()
+	config := configuration.Configuration{
+		Storage: configuration.Storage{
+			"filesystem": configuration.Parameters{"rootdirectory": root},
+			"cache":      configuration.Parameters{"blobdescriptor": "inmemory"},
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
+				"enabled": false,
+			}},
+		},
+	}
+	config.HTTP.Headers = headerConfig
+	env := newTestEnvWithConfig(t, &config)
+	defer env.Shutdown()
+
+	args := makeBlobArgs(t)
+	uploadURLBase, _ := startPushLayer(t, env, args.imageName)
+	blobURL := pushLayer(t, env.builder, args.imageName, args.layerDigest, uploadURLBase, args.layerFile)
+
+	// Remove the blob file; the cached descriptor stays.
+	if err := os.RemoveAll(filepath.Join(root, "docker/registry/v2/blobs")); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Get(blobURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	checkResponse(t, "fetching a blob whose file is missing", resp, http.StatusNotFound)
+	checkBodyHasErrorCodes(t, "fetching a blob whose file is missing", resp, errcode.ErrorCodeBlobUnknown)
 }
 
 func TestBlobDelete(t *testing.T) {
@@ -1142,6 +1245,26 @@ func testBlobAPI(t *testing.T, env *testEnv, args blobArgs) *testEnv {
 	defer resp.Body.Close()
 	checkResponse(t, "fetching layer with etag", resp, http.StatusNotModified)
 
+	// Send an If-Match value that does not match the ETag of the blob.
+	// The registry must answer with 412 Precondition Failed.
+	req, err = http.NewRequest(http.MethodGet, layerURL, nil)
+	if err != nil {
+		t.Fatalf("Error constructing request: %s", err)
+	}
+	req.Header.Set("If-Match", `"different"`)
+
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Error constructing request: %s", err)
+	}
+	defer resp.Body.Close()
+	checkResponse(t, "in response to request with bad If-Match value", resp, http.StatusPreconditionFailed)
+	// The registry sends this 412 without a body, so the response
+	// must announce a Content-Length of 0.
+	if resp.ContentLength != 0 {
+		t.Fatalf("412 response announces Content-Length %d, want 0", resp.ContentLength)
+	}
+
 	// Non-matching etag, gives 200
 	req, err = http.NewRequest(http.MethodGet, layerURL, nil)
 	if err != nil {
@@ -1486,6 +1609,44 @@ func TestManifestAPI_DeleteTag_DeleteDisabled(t *testing.T) {
 	checkErr(t, err, msg)
 	defer resp.Body.Close()
 	checkResponse(t, msg, resp, http.StatusOK)
+}
+
+func TestManifestAPI_NameTooLong(t *testing.T) {
+	config := configuration.Configuration{
+		Storage: configuration.Storage{
+			"inmemory":    configuration.Parameters{},
+			"cache":       configuration.Parameters{"blobdescriptor": "inmemory"},
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{"enabled": false}},
+		},
+	}
+	config.HTTP.Headers = headerConfig
+	env := newTestEnvWithConfig(t, &config)
+	defer env.Shutdown()
+
+	// "foo" is a domain to WithName but part of the path (docker.io/foo/...) to the cache.
+	for _, tc := range []struct {
+		name string
+		repo string
+	}{
+		{
+			name: "rejected by reference.WithName",
+			repo: "foo/" + strings.Repeat("a", reference.RepositoryNameTotalLengthMax+1),
+		},
+		{
+			name: "rejected by the blob descriptor cache",
+			repo: "foo/" + strings.Repeat("a", reference.RepositoryNameTotalLengthMax),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := http.Get(env.server.URL + "/v2/" + tc.repo + "/manifests/latest")
+			checkErr(t, err, tc.name)
+			defer resp.Body.Close()
+
+			checkResponse(t, tc.name, resp, http.StatusBadRequest)
+			// nolint:errcheck
+			checkBodyHasErrorCodes(t, tc.name, resp, errcode.ErrorCodeNameInvalid)
+		})
+	}
 }
 
 // storageManifestErrDriverFactory implements the factory.StorageDriverFactory interface.
@@ -2619,7 +2780,7 @@ func pushChunk(t *testing.T, ub *v2.URLBuilder, name reference.Named, uploadURLB
 
 func checkResponse(t *testing.T, msg string, resp *http.Response, expectedStatus int) {
 	if resp.StatusCode != expectedStatus {
-		t.Logf("unexpected status %s: expected %v, got %v", msg, resp.StatusCode, expectedStatus)
+		t.Logf("unexpected status %s: expected %v, got %v", msg, expectedStatus, resp.StatusCode)
 		maybeDumpResponse(t, resp)
 		t.FailNow()
 	}

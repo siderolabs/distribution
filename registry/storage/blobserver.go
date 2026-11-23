@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -13,6 +14,12 @@ import (
 
 // TODO(stevvooe): This should configurable in the future.
 const blobCacheControlMaxAge = 365 * 24 * time.Hour
+
+type seekableReaderDriver interface {
+	// ReadSeeker opens path at offset zero. Seeking to the end reports the
+	// content size. The caller must close the reader.
+	ReadSeeker(ctx context.Context, path string) (io.ReadSeekCloser, error)
+}
 
 // blobServer simply serves blobs from a driver instance using a path function
 // to identify paths and a descriptor service to fill in metadata.
@@ -47,7 +54,15 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 		// Fallback to serving the content directly.
 	}
 
-	br, err := newFileReader(ctx, bs.driver, path, desc.Size)
+	var br io.ReadSeekCloser
+	if seekable, ok := bs.driver.(seekableReaderDriver); ok && r.Method == http.MethodGet {
+		br, err = seekable.ReadSeeker(ctx, path)
+		if _, ok := err.(driver.PathNotFoundError); ok {
+			return distribution.ErrBlobUnknown
+		}
+	} else {
+		br, err = newFileReader(ctx, bs.driver, path, desc.Size)
+	}
 	if err != nil {
 		return err
 	}
@@ -65,11 +80,7 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 		w.Header().Set("Content-Type", desc.MediaType)
 	}
 
-	if w.Header().Get("Content-Length") == "" {
-		// Set the content length if not already set.
-		w.Header().Set("Content-Length", fmt.Sprint(desc.Size))
-	}
-
+	// ServeContent sets Content-Length. A value set here would be sent with a 412.
 	http.ServeContent(w, r, desc.Digest.String(), time.Time{}, br)
 	return nil
 }
